@@ -1,0 +1,56 @@
+{
+  "_comment": "Reference configuration for the VirusTotal app inside Shuffle. This is documentation, not a file Shuffle reads directly - actual credentials are configured in the Shuffle UI per-workflow and pulled from environment variables.",
+
+  "api_version": "v2",
+  "base_url": "https://www.virustotal.com/vtapi/v2",
+  "authentication": {
+    "method": "api_key_query_param",
+    "param_name": "apikey",
+    "source": "$ENV.VIRUSTOTAL_API_KEY"
+  },
+
+  "free_tier_limits": {
+    "requests_per_minute": 4,
+    "requests_per_day": 500,
+    "notes": "Public API only - no commercial/automated mass-scanning use. Sufficient for a home lab or low-volume SOC automation demo. Add a caching layer before production use to avoid burning quota on repeat IOCs."
+  },
+
+  "endpoints_used": [
+    {
+      "path": "/file/report",
+      "method": "GET",
+      "params": ["apikey", "resource"],
+      "used_by": "Playbook 02 - Malware Detection",
+      "returns": ["positives", "total", "scans", "scan_date", "permalink", "suggested_threat_label"]
+    },
+    {
+      "path": "/url/report",
+      "method": "GET",
+      "params": ["apikey", "resource", "scan"],
+      "used_by": "Playbook 01 - Phishing Email",
+      "returns": ["positives", "total", "scan_date", "permalink", "scans"]
+    },
+    {
+      "path": "/domain/report",
+      "method": "GET",
+      "params": ["apikey", "domain"],
+      "used_by": "Playbook 01 - Phishing Email",
+      "returns": ["categories", "detected_urls", "whois", "resolutions"]
+    },
+    {
+      "path": "/ip-address/report",
+      "method": "GET",
+      "params": ["apikey", "ip"],
+      "used_by": "Playbook 03 - Brute Force, Playbook 04 - Suspicious IP",
+      "returns": ["detected_urls", "detected_communicating_samples", "country", "as_owner", "resolutions"]
+    }
+  ],
+
+  "threat_scoring_thresholds": {
+    "_comment": "Used by the 'Calculate Threat Score' step in each playbook - tune these for your environment",
+    "critical": { "min_positives": 15, "action": "auto_contain_immediately" },
+    "high": { "min_positives": 6, "action": "auto_contain" },
+    "medium": { "min_positives": 2, "action": "log_and_alert_analyst" },
+    "low": { "min_positives": 0, "action": "log_only" }
+  }
+}

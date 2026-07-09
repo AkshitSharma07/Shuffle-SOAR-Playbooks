@@ -1,0 +1,69 @@
+<!--
+  Custom Wazuh Detection Rules
+  ============================
+  Place this file at /var/ossec/etc/rules/local_rules.xml on the Wazuh Manager
+  (or merge into your existing local_rules.xml), then restart the manager:
+
+      systemctl restart wazuh-manager
+
+  These rules are intentionally simple "uplift" rules layered on top of Wazuh's
+  default ruleset (rule IDs 31100-31199 for web/mail, 5700-5799 for auth,
+  87100-87199 for syscheck/FIM are part of Wazuh's stock rules and do not need
+  to be redefined here - they are listed in the manual/README for reference).
+
+  Custom rule ID range used below: 100100-100199 (local/custom range, safe from
+  collisions with Wazuh's own rule IDs and any other vendor rulesets).
+-->
+<group name="local,soar_automation,">
+
+  <!-- ============================================================ -->
+  <!-- PHISHING - additional URL/domain pattern matching            -->
+  <!-- Complements stock rules 31101 / 31103 / 31530                -->
+  <!-- ============================================================ -->
+  <rule id="100101" level="10">
+    <if_group>web,mail</if_group>
+    <regex type="pcre2">(?i)(bit\.ly|tinyurl|grabify|herokuapp\.com/login|secure-verify|account-update)</regex>
+    <description>Possible phishing indicator: shortened or credential-harvesting style URL detected in mail/web log</description>
+    <group>phishing,soar_trigger,</group>
+  </rule>
+
+  <!-- ============================================================ -->
+  <!-- MALWARE - FIM alert escalation for executable file types     -->
+  <!-- Complements stock rules 87100 / 87105 / 553                  -->
+  <!-- ============================================================ -->
+  <rule id="100110" level="12">
+    <if_sid>550</if_sid>
+    <field name="file" type="pcre2">(?i)\.(exe|dll|scr|ps1|vbs|bat)$</field>
+    <description>New or modified executable file detected via FIM - candidate for VirusTotal hash lookup</description>
+    <group>malware,fim,soar_trigger,</group>
+  </rule>
+
+  <!-- ============================================================ -->
+  <!-- BRUTE FORCE - SSH and RDP frequency rules                    -->
+  <!-- Complements stock rules 5712 / 5716 / 5720                   -->
+  <!-- ============================================================ -->
+  <rule id="100120" level="10" frequency="5" timeframe="120">
+    <if_matched_sid>5716</if_matched_sid>
+    <description>SSH brute force: 5 or more failed logins from the same source within 120 seconds</description>
+    <group>authentication_failures,brute_force,soar_trigger,</group>
+  </rule>
+
+  <rule id="100121" level="10" frequency="5" timeframe="120">
+    <if_matched_sid>18152</if_matched_sid>
+    <description>RDP brute force: 5 or more failed logins from the same source within 120 seconds</description>
+    <group>authentication_failures,brute_force,soar_trigger,</group>
+  </rule>
+
+  <!-- ============================================================ -->
+  <!-- SUSPICIOUS IP - outbound connection to non-allow-listed IP   -->
+  <!-- Requires a custom decoder/log source (e.g. Sysmon Event ID 3 -->
+  <!-- or a firewall log forwarded to Wazuh)                        -->
+  <!-- ============================================================ -->
+  <rule id="100130" level="7">
+    <if_group>sysmon_event3</if_group>
+    <field name="dest_ip" negate="yes" type="pcre2">^(10\.|172\.16\.|192\.168\.)</field>
+    <description>Outbound connection to a non-private destination IP - routed to enrichment playbook</description>
+    <group>network,soar_trigger,</group>
+  </rule>
+
+</group>

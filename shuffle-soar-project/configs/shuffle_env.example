@@ -1,0 +1,62 @@
+# =============================================================
+# Shuffle SOAR Project - Environment Variable Template
+# =============================================================
+# Copy this file to .env and fill in real values:
+#   cp configs/shuffle_env.example .env
+#
+# NEVER commit the real .env file to GitHub. It is already
+# listed in .gitignore. Only this .example file should be
+# tracked in version control.
+# =============================================================
+
+# ---- VirusTotal -------------------------------------------------
+# Free tier: https://www.virustotal.com/gui/sign-in -> API Key
+# Limits: 500 requests/day, 4 requests/minute
+VIRUSTOTAL_API_KEY=your_virustotal_api_key_here
+
+# ---- Wazuh --------------------------------------------------------
+# Wazuh API runs on the manager, default port 55000
+WAZUH_API_URL=https://your-wazuh-manager:55000
+WAZUH_API_TOKEN=your_wazuh_api_jwt_token_here
+WAZUH_API_USER=wazuh-wui
+WAZUH_API_PASS=change_this_password
+
+# ---- Firewall (generic REST-based firewall / NGFW API) -----------
+# Replace with your actual firewall vendor's API base URL
+# (e.g. pfSense REST API, Palo Alto PAN-OS API, FortiGate API)
+FIREWALL_API_URL=https://your-firewall-api.local/api/v1
+FIREWALL_API_KEY=your_firewall_api_key_here
+
+# ---- Slack ----------------------------------------------------------
+# https://api.slack.com/apps -> Create App -> OAuth & Permissions
+# Required scopes: chat:write
+SLACK_BOT_TOKEN=xoxb-your-slack-bot-token-here
+SLACK_SOC_CHANNEL=#soc-alerts
+SLACK_CRITICAL_CHANNEL=#soc-critical
+
+# ---- Email / SMTP --------------------------------------------------
+SMTP_HOST=smtp.your-provider.com
+SMTP_PORT=587
+SMTP_USER=soc-automation@yourdomain.com
+SMTP_PASS=your_smtp_password_or_app_password
+SOC_EMAIL=soc-team@yourdomain.com
+
+# ---- TheHive (optional case management) ---------------------------
+THEHIVE_URL=https://your-thehive-instance:9000
+THEHIVE_API_KEY=your_thehive_api_key_here
+
+# ---- GeoIP (used by Playbook 4 - Suspicious IP Enrichment) --------
+# Free options: ipinfo.io, ip-api.com, MaxMind GeoLite2
+GEOIP_API_URL=https://ipinfo.io
+GEOIP_API_KEY=your_geoip_api_key_here
+
+# ---- Dashboard (optional - Playbook 4 enrichment sink) ------------
+DASHBOARD_API_URL=https://your-internal-dashboard.local/api
+
+# ---- Shuffle Webhook URLs (generated per-workflow inside Shuffle) -
+# After importing each playbook into Shuffle, copy its webhook URL
+# here and configure Wazuh's integration to POST to it.
+SHUFFLE_WEBHOOK_PHISHING=http://localhost:3001/api/v1/hooks/webhook_id_1
+SHUFFLE_WEBHOOK_MALWARE=http://localhost:3001/api/v1/hooks/webhook_id_2
+SHUFFLE_WEBHOOK_BRUTEFORCE=http://localhost:3001/api/v1/hooks/webhook_id_3
+SHUFFLE_WEBHOOK_SUSPICIOUS_IP=http://localhost:3001/api/v1/hooks/webhook_id_4

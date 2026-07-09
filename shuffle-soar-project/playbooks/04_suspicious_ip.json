@@ -1,0 +1,182 @@
+{
+  "id": "playbook_suspicious_ip_enrichment",
+  "name": "Playbook 04 - Suspicious IP Enrichment",
+  "description": "Enrichment-first playbook for outbound connections to IPs not on an allow-list. Builds GeoIP and VirusTotal context before making a conditional containment decision, and logs full enrichment for analyst triage even when no block occurs.",
+  "status": "production",
+  "triggers": [
+    {
+      "type": "webhook",
+      "name": "Wazuh Outbound Connection Alert",
+      "description": "Fires on custom Wazuh rule for outbound connections to destination IPs not present in the allow-list (see configs/wazuh_rules.xml)",
+      "id": "trigger_suspicious_ip_webhook",
+      "parameters": {
+        "auth_method": "bearer_token",
+        "expected_fields": ["data.dest_ip", "data.src_host", "data.dest_port", "data.process_name"]
+      }
+    }
+  ],
+  "workflow": {
+    "steps": [
+      {
+        "step": 1,
+        "id": "parse_connection_alert",
+        "name": "Parse Connection Alert",
+        "app": "Shuffle Tools",
+        "action": "parse_json",
+        "description": "Extract destination IP, source host, destination port, and initiating process from the Wazuh alert",
+        "input": {
+          "raw_alert": "$trigger.body"
+        },
+        "output": {
+          "dest_ip": "$.data.dest_ip",
+          "src_host": "$.data.src_host",
+          "dest_port": "$.data.dest_port",
+          "process_name": "$.data.process_name",
+          "agent_id": "$.agent.id",
+          "timestamp": "$.timestamp"
+        }
+      },
+      {
+        "step": 2,
+        "id": "geoip_lookup",
+        "name": "GeoIP Lookup",
+        "app": "HTTP",
+        "action": "GET",
+        "description": "Resolve country, ASN, and hosting provider for the destination IP - bulletproof hosting or high-risk regions raise the baseline score",
+        "input": {
+          "url": "$ENV.GEOIP_API_URL/$steps.parse_connection_alert.dest_ip",
+          "headers": {
+            "Authorization": "Bearer $ENV.GEOIP_API_KEY"
+          }
+        },
+        "output": {
+          "geo_country": "$.country",
+          "geo_asn": "$.asn",
+          "geo_hosting_provider": "$.org",
+          "geo_is_hosting": "$.hosting"
+        }
+      },
+      {
+        "step": 3,
+        "id": "virustotal_ip_scan",
+        "name": "VirusTotal IP Scan",
+        "app": "VirusTotal",
+        "action": "get_ip_report",
+        "description": "Check the destination IP for AV/community detections and any malware samples known to have communicated with it",
+        "input": {
+          "apikey": "$ENV.VIRUSTOTAL_API_KEY",
+          "ip": "$steps.parse_connection_alert.dest_ip"
+        },
+        "output": {
+          "vt_detected_urls": "$.detected_urls",
+          "vt_detected_samples": "$.detected_communicating_samples",
+          "vt_passive_dns": "$.resolutions",
+          "vt_reputation": "$.reputation"
+        }
+      },
+      {
+        "step": 4,
+        "id": "calculate_threat_score",
+        "name": "Composite Threat Scoring",
+        "app": "Shuffle Tools",
+        "action": "calculate",
+        "description": "Combine GeoIP risk signal (hosting provider, region) with VT detection count into a single composite score",
+        "input": {
+          "geo_risk_weight": "$steps.geoip_lookup.geo_is_hosting == true ? 30 : 0",
+          "vt_risk_weight": "$steps.virustotal_ip_scan.vt_detected_samples.length * 10",
+          "formula": "geo_risk_weight + vt_risk_weight"
+        },
+        "output": {
+          "composite_score": "$.result",
+          "score_label": "$.threshold_label"
+        }
+      },
+      {
+        "step": 5,
+        "id": "decision_block",
+        "name": "Score High Enough to Block?",
+        "app": "Shuffle Tools",
+        "action": "condition",
+        "description": "Only the highest-confidence composite scores trigger an automatic outbound block; everything else is logged for analyst review",
+        "condition": {
+          "field": "$steps.calculate_threat_score.composite_score",
+          "operator": "greater_than",
+          "value": 40
+        },
+        "branches": {
+          "true": "conditional_block",
+          "false": "log_to_dashboard"
+        }
+      },
+      {
+        "step": 6,
+        "id": "conditional_block",
+        "name": "Block Outbound Connection",
+        "app": "HTTP",
+        "action": "POST",
+        "description": "Block outbound traffic to the destination IP at the firewall",
+        "condition": "score > 40",
+        "input": {
+          "url": "$ENV.FIREWALL_API_URL/block",
+          "headers": {
+            "Authorization": "Bearer $ENV.FIREWALL_API_KEY"
+          },
+          "body": {
+            "action": "block",
+            "type": "ip",
+            "direction": "outbound",
+            "value": "$steps.parse_connection_alert.dest_ip",
+            "reason": "Composite threat score $steps.calculate_threat_score.composite_score - GeoIP + VT enrichment",
+            "created_by": "Shuffle-SOAR-Auto"
+          }
+        }
+      },
+      {
+        "step": 7,
+        "id": "log_to_dashboard",
+        "name": "Log Enrichment to Dashboard",
+        "app": "Shuffle Tools",
+        "action": "log",
+        "description": "Lower-confidence connections are not blocked but the full enrichment is preserved so a Tier-1 analyst doing manual triage already has the context",
+        "condition": "score <= 40",
+        "input": {
+          "level": "INFO",
+          "message": "Outbound connection enriched - below auto-block threshold",
+          "data": {
+            "dest_ip": "$steps.parse_connection_alert.dest_ip",
+            "geo_country": "$steps.geoip_lookup.geo_country",
+            "geo_hosting_provider": "$steps.geoip_lookup.geo_hosting_provider",
+            "vt_reputation": "$steps.virustotal_ip_scan.vt_reputation",
+            "composite_score": "$steps.calculate_threat_score.composite_score",
+            "process_name": "$steps.parse_connection_alert.process_name"
+          }
+        }
+      },
+      {
+        "step": 8,
+        "id": "update_dashboard_widget",
+        "name": "Push to SOC Dashboard",
+        "app": "HTTP",
+        "action": "POST",
+        "description": "Send the enriched record to a lightweight dashboard so analysts can see enrichment context for all outbound connections, blocked or not",
+        "input": {
+          "url": "$ENV.DASHBOARD_API_URL/connections",
+          "body": {
+            "dest_ip": "$steps.parse_connection_alert.dest_ip",
+            "src_host": "$steps.parse_connection_alert.src_host",
+            "score": "$steps.calculate_threat_score.composite_score",
+            "blocked": "$steps.decision_block.result",
+            "timestamp": "$steps.parse_connection_alert.timestamp"
+          }
+        }
+      }
+    ]
+  },
+  "metadata": {
+    "author": "SOC Automation Team",
+    "version": "1.0.0",
+    "tags": ["ioc-enrichment", "geoip", "c2", "triage-aid"],
+    "mitre_attack": ["T1071", "T1102"],
+    "estimated_runtime_seconds": 25
+  }
+}

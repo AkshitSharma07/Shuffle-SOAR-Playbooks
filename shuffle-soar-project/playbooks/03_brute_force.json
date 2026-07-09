@@ -1,0 +1,207 @@
+{
+  "id": "playbook_brute_force_response",
+  "name": "Playbook 03 - Brute Force Attack Response",
+  "description": "Automated brute-force response: receives Wazuh frequency-rule alert on repeated failed logins, enriches the source IP via VirusTotal reputation, and auto-blocks at the firewall when the IP is malicious or attempt count is high.",
+  "status": "production",
+  "triggers": [
+    {
+      "type": "webhook",
+      "name": "Wazuh Brute Force Alert",
+      "description": "Fires on Wazuh frequency rules for repeated authentication failures (Rule IDs: 5712, 5720, 5716, 60122)",
+      "id": "trigger_bruteforce_webhook",
+      "parameters": {
+        "auth_method": "bearer_token",
+        "expected_fields": ["rule_id", "data.srcip", "data.dstuser", "data.protocol", "agent.name"]
+      }
+    }
+  ],
+  "workflow": {
+    "steps": [
+      {
+        "step": 1,
+        "id": "parse_bruteforce_alert",
+        "name": "Parse Brute Force Alert",
+        "app": "Shuffle Tools",
+        "action": "parse_json",
+        "description": "Extract source IP, target user, attempt count, and protocol from the Wazuh frequency-rule alert",
+        "input": {
+          "raw_alert": "$trigger.body"
+        },
+        "output": {
+          "source_ip": "$.data.srcip",
+          "target_user": "$.data.dstuser",
+          "protocol": "$.data.protocol",
+          "attempt_count": "$.data.win.eventdata.failureCount",
+          "rule_id": "$.rule.id",
+          "rule_level": "$.rule.level",
+          "hostname": "$.agent.name",
+          "agent_ip": "$.agent.ip",
+          "timestamp": "$.timestamp"
+        }
+      },
+      {
+        "step": 2,
+        "id": "virustotal_ip_report",
+        "name": "VirusTotal IP Reputation Report",
+        "app": "VirusTotal",
+        "action": "get_ip_report",
+        "description": "Check the source IP's reputation - community detections, passive DNS history, and known malicious associations",
+        "input": {
+          "apikey": "$ENV.VIRUSTOTAL_API_KEY",
+          "ip": "$steps.parse_bruteforce_alert.source_ip"
+        },
+        "output": {
+          "vt_detected_urls": "$.detected_urls",
+          "vt_detected_samples": "$.detected_communicating_samples",
+          "vt_country": "$.country",
+          "vt_as_owner": "$.as_owner",
+          "vt_reputation_score": "$.reputation"
+        }
+      },
+      {
+        "step": 3,
+        "id": "calculate_brute_force_risk",
+        "name": "Calculate Combined Risk Score",
+        "app": "Shuffle Tools",
+        "action": "calculate",
+        "description": "Combine VT reputation signal with raw attempt count - either signal alone is noisy, together they reduce false positives",
+        "input": {
+          "vt_malicious": "$steps.virustotal_ip_report.vt_detected_urls.length > 0 OR $steps.virustotal_ip_report.vt_detected_samples.length > 0",
+          "attempt_count": "$steps.parse_bruteforce_alert.attempt_count",
+          "formula": "vt_malicious == true OR attempt_count >= 10"
+        },
+        "output": {
+          "is_malicious": "$.result",
+          "risk_reason": "$.reason"
+        }
+      },
+      {
+        "step": 4,
+        "id": "decision_block",
+        "name": "Is Source Malicious or High-Volume?",
+        "app": "Shuffle Tools",
+        "action": "condition",
+        "description": "Route workflow based on combined VT reputation + attempt count signal",
+        "condition": {
+          "field": "$steps.calculate_brute_force_risk.is_malicious",
+          "operator": "equals",
+          "value": true
+        },
+        "branches": {
+          "true": "auto_block_ip",
+          "false": "rate_limit_monitor"
+        }
+      },
+      {
+        "step": 5,
+        "id": "auto_block_ip",
+        "name": "Auto-Block Source IP",
+        "app": "HTTP",
+        "action": "POST",
+        "description": "Block the attacking IP at the perimeter firewall, scoped to the affected protocol",
+        "condition": "malicious == true",
+        "input": {
+          "url": "$ENV.FIREWALL_API_URL/block",
+          "headers": {
+            "Authorization": "Bearer $ENV.FIREWALL_API_KEY",
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "action": "block",
+            "type": "ip",
+            "value": "$steps.parse_bruteforce_alert.source_ip",
+            "scope_protocol": "$steps.parse_bruteforce_alert.protocol",
+            "reason": "Brute force attempt - $steps.parse_bruteforce_alert.attempt_count failed logins against $steps.parse_bruteforce_alert.target_user",
+            "duration": "24h",
+            "created_by": "Shuffle-SOAR-Auto"
+          }
+        },
+        "output": {
+          "block_status": "$.status",
+          "block_rule_id": "$.rule_id"
+        }
+      },
+      {
+        "step": 6,
+        "id": "sync_wazuh_active_response",
+        "name": "Sync Block to Wazuh Active Response",
+        "app": "HTTP",
+        "action": "POST",
+        "description": "Push the same block into Wazuh active-response so host-level firewalls stay consistent with the perimeter block",
+        "condition": "malicious == true",
+        "input": {
+          "url": "$ENV.WAZUH_API_URL/active-response",
+          "headers": {
+            "Authorization": "Bearer $ENV.WAZUH_API_TOKEN"
+          },
+          "body": {
+            "command": "block-ip",
+            "arguments": ["$steps.parse_bruteforce_alert.source_ip"],
+            "alert": {
+              "data": {
+                "srcip": "$steps.parse_bruteforce_alert.source_ip"
+              }
+            }
+          }
+        }
+      },
+      {
+        "step": 7,
+        "id": "rate_limit_monitor",
+        "name": "Rate-Limit & Continue Monitoring",
+        "app": "Shuffle Tools",
+        "action": "log",
+        "description": "For lower-confidence cases, log the source for continued monitoring instead of an outright block",
+        "condition": "malicious == false",
+        "input": {
+          "level": "WARNING",
+          "message": "Brute force attempts below auto-block threshold - monitoring source IP",
+          "data": {
+            "source_ip": "$steps.parse_bruteforce_alert.source_ip",
+            "attempt_count": "$steps.parse_bruteforce_alert.attempt_count",
+            "target_user": "$steps.parse_bruteforce_alert.target_user"
+          }
+        }
+      },
+      {
+        "step": 8,
+        "id": "notify_slack",
+        "name": "Slack Notification",
+        "app": "Slack",
+        "action": "post_message",
+        "description": "Report the source IP, target account, attempt count, and VT reputation summary to the SOC channel",
+        "input": {
+          "apikey": "$ENV.SLACK_BOT_TOKEN",
+          "channel": "#soc-alerts",
+          "message": {
+            "blocks": [
+              {
+                "type": "header",
+                "text": "\ud83d\udd11 BRUTE FORCE ATTEMPT DETECTED"
+              },
+              {
+                "type": "section",
+                "fields": [
+                  "**Source IP:** $steps.parse_bruteforce_alert.source_ip",
+                  "**Target User:** $steps.parse_bruteforce_alert.target_user",
+                  "**Protocol:** $steps.parse_bruteforce_alert.protocol",
+                  "**Attempts:** $steps.parse_bruteforce_alert.attempt_count",
+                  "**Host:** $steps.parse_bruteforce_alert.hostname",
+                  "**VT Reputation:** $steps.virustotal_ip_report.vt_reputation_score",
+                  "**Action Taken:** $steps.calculate_brute_force_risk.is_malicious"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "metadata": {
+    "author": "SOC Automation Team",
+    "version": "1.0.0",
+    "tags": ["brute-force", "ip-reputation", "auto-block", "ssh", "rdp"],
+    "mitre_attack": ["T1110", "T1110.001", "T1110.003"],
+    "estimated_runtime_seconds": 30
+  }
+}

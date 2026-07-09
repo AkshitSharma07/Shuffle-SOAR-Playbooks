@@ -1,0 +1,296 @@
+{
+  "id": "playbook_phishing_email_response",
+  "name": "Playbook 01 - Phishing Email Response",
+  "description": "Automated phishing email incident response: extracts IOCs from Wazuh alerts, enriches with VirusTotal, blocks malicious domains, and notifies SOC team.",
+  "status": "production",
+  "triggers": [
+    {
+      "type": "webhook",
+      "name": "Wazuh Alert Webhook",
+      "description": "Receives alerts from Wazuh SIEM when phishing-related rules fire (Rule IDs: 31101, 31103, 31530)",
+      "id": "trigger_wazuh_webhook",
+      "parameters": {
+        "auth_method": "bearer_token",
+        "expected_fields": ["rule_id", "alert_level", "src_ip", "data.srcuser", "data.url"]
+      }
+    }
+  ],
+  "workflow": {
+    "steps": [
+      {
+        "step": 1,
+        "id": "parse_wazuh_alert",
+        "name": "Parse Wazuh Alert",
+        "app": "Shuffle Tools",
+        "action": "parse_json",
+        "description": "Extract key fields from incoming Wazuh JSON alert",
+        "input": {
+          "raw_alert": "$trigger.body",
+          "extract_fields": [
+            "rule.id",
+            "rule.level",
+            "rule.description",
+            "data.srcip",
+            "data.url",
+            "data.dstuser",
+            "agent.name",
+            "timestamp"
+          ]
+        },
+        "output": {
+          "rule_id": "$.rule.id",
+          "severity": "$.rule.level",
+          "source_ip": "$.data.srcip",
+          "suspicious_url": "$.data.url",
+          "target_user": "$.data.dstuser",
+          "hostname": "$.agent.name",
+          "alert_time": "$.timestamp"
+        }
+      },
+      {
+        "step": 2,
+        "id": "extract_iocs",
+        "name": "Extract IOCs from Alert",
+        "app": "Shuffle Tools",
+        "action": "regex_extract",
+        "description": "Use regex to extract URLs, domains, and IPs from alert data",
+        "input": {
+          "text": "$steps.parse_wazuh_alert.suspicious_url",
+          "patterns": {
+            "urls": "(https?://[^\\s]+)",
+            "domains": "([a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\\.[a-zA-Z]{2,})",
+            "ips": "(\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b)"
+          }
+        },
+        "output": {
+          "extracted_urls": "$.urls",
+          "extracted_domains": "$.domains",
+          "extracted_ips": "$.ips"
+        }
+      },
+      {
+        "step": 3,
+        "id": "virustotal_url_scan",
+        "name": "VirusTotal URL Scan",
+        "app": "VirusTotal",
+        "action": "get_url_report",
+        "description": "Submit extracted URL to VirusTotal for reputation check",
+        "input": {
+          "apikey": "$ENV.VIRUSTOTAL_API_KEY",
+          "resource": "$steps.extract_iocs.extracted_urls[0]",
+          "scan": true
+        },
+        "output": {
+          "vt_positives": "$.positives",
+          "vt_total": "$.total",
+          "vt_scan_date": "$.scan_date",
+          "vt_permalink": "$.permalink",
+          "vt_scans": "$.scans",
+          "malicious_score": "$.positives"
+        }
+      },
+      {
+        "step": 4,
+        "id": "virustotal_domain_scan",
+        "name": "VirusTotal Domain Lookup",
+        "app": "VirusTotal",
+        "action": "get_domain_report",
+        "description": "Check domain reputation in VirusTotal",
+        "input": {
+          "apikey": "$ENV.VIRUSTOTAL_API_KEY",
+          "domain": "$steps.extract_iocs.extracted_domains[0]"
+        },
+        "output": {
+          "domain_categories": "$.categories",
+          "domain_detected_urls": "$.detected_urls",
+          "domain_whois": "$.whois",
+          "domain_resolutions": "$.resolutions"
+        }
+      },
+      {
+        "step": 5,
+        "id": "calculate_threat_score",
+        "name": "Calculate Threat Score",
+        "app": "Shuffle Tools",
+        "action": "calculate",
+        "description": "Aggregate VT results into a composite threat score (0-100)",
+        "input": {
+          "formula": "($steps.virustotal_url_scan.vt_positives / $steps.virustotal_url_scan.vt_total) * 100",
+          "thresholds": {
+            "critical": 50,
+            "high": 25,
+            "medium": 10,
+            "low": 0
+          }
+        },
+        "output": {
+          "threat_percentage": "$.result",
+          "threat_level": "$.threshold_label"
+        }
+      },
+      {
+        "step": 6,
+        "id": "decision_block",
+        "name": "Is Threat Malicious?",
+        "app": "Shuffle Tools",
+        "action": "condition",
+        "description": "Route workflow based on VirusTotal malicious detections",
+        "condition": {
+          "field": "$steps.virustotal_url_scan.vt_positives",
+          "operator": "greater_than",
+          "value": 5
+        },
+        "branches": {
+          "true": "block_domain",
+          "false": "log_and_monitor"
+        }
+      },
+      {
+        "step": 7,
+        "id": "block_domain",
+        "name": "Block Malicious Domain (Firewall)",
+        "app": "HTTP",
+        "action": "POST",
+        "description": "Call firewall API to block the malicious domain via DNS sinkholes",
+        "condition": "malicious == true",
+        "input": {
+          "url": "$ENV.FIREWALL_API_URL/block",
+          "headers": {
+            "Authorization": "Bearer $ENV.FIREWALL_API_KEY",
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "action": "block",
+            "type": "domain",
+            "value": "$steps.extract_iocs.extracted_domains[0]",
+            "reason": "Phishing URL detected - VT score: $steps.virustotal_url_scan.vt_positives/$steps.virustotal_url_scan.vt_total",
+            "duration": "permanent",
+            "created_by": "Shuffle-SOAR-Auto"
+          }
+        },
+        "output": {
+          "block_status": "$.status",
+          "block_rule_id": "$.rule_id"
+        }
+      },
+      {
+        "step": 8,
+        "id": "block_source_ip",
+        "name": "Block Source IP",
+        "app": "HTTP",
+        "action": "POST",
+        "description": "Block attacker source IP at perimeter firewall",
+        "condition": "malicious == true",
+        "input": {
+          "url": "$ENV.FIREWALL_API_URL/block",
+          "body": {
+            "action": "block",
+            "type": "ip",
+            "value": "$steps.parse_wazuh_alert.source_ip",
+            "reason": "Source of phishing email - Automated block",
+            "created_by": "Shuffle-SOAR-Auto"
+          }
+        }
+      },
+      {
+        "step": 9,
+        "id": "notify_slack",
+        "name": "Send Slack Alert",
+        "app": "Slack",
+        "action": "post_message",
+        "description": "Notify SOC channel with enriched alert details",
+        "input": {
+          "apikey": "$ENV.SLACK_BOT_TOKEN",
+          "channel": "#soc-alerts",
+          "message": {
+            "blocks": [
+              {
+                "type": "header",
+                "text": "🚨 PHISHING EMAIL DETECTED & CONTAINED"
+              },
+              {
+                "type": "section",
+                "fields": [
+                  "**Severity:** CRITICAL",
+                  "**Host:** $steps.parse_wazuh_alert.hostname",
+                  "**Target User:** $steps.parse_wazuh_alert.target_user",
+                  "**Source IP:** $steps.parse_wazuh_alert.source_ip",
+                  "**Malicious URL:** $steps.extract_iocs.extracted_urls[0]",
+                  "**VT Score:** $steps.virustotal_url_scan.vt_positives/$steps.virustotal_url_scan.vt_total",
+                  "**Action Taken:** Domain & IP BLOCKED",
+                  "**VT Report:** $steps.virustotal_url_scan.vt_permalink"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      {
+        "step": 10,
+        "id": "send_email_alert",
+        "name": "Email SOC Team",
+        "app": "SMTP",
+        "action": "send_email",
+        "description": "Send detailed incident email to SOC team and management",
+        "input": {
+          "smtp_host": "$ENV.SMTP_HOST",
+          "smtp_port": 587,
+          "username": "$ENV.SMTP_USER",
+          "password": "$ENV.SMTP_PASS",
+          "to": "$ENV.SOC_EMAIL",
+          "subject": "[CRITICAL] Phishing Email Incident - Auto-Contained - $steps.parse_wazuh_alert.alert_time",
+          "body": "AUTOMATED INCIDENT RESPONSE REPORT\n\nIncident Type: Phishing Email\nStatus: AUTOMATICALLY CONTAINED\n\nDetails:\n- Host: $steps.parse_wazuh_alert.hostname\n- User: $steps.parse_wazuh_alert.target_user\n- Source IP: $steps.parse_wazuh_alert.source_ip\n- Malicious URL: $steps.extract_iocs.extracted_urls[0]\n- VirusTotal Score: $steps.virustotal_url_scan.vt_positives/$steps.virustotal_url_scan.vt_total\n\nActions Taken:\n- Domain BLOCKED at firewall\n- Source IP BLOCKED\n- SOC notified via Slack\n\nFull VT Report: $steps.virustotal_url_scan.vt_permalink\n\nThis is an automated response. Please review and update the case."
+        }
+      },
+      {
+        "step": 11,
+        "id": "log_and_monitor",
+        "name": "Log & Monitor (Non-Malicious)",
+        "app": "Shuffle Tools",
+        "action": "log",
+        "description": "For low-score alerts, log for monitoring without blocking",
+        "condition": "malicious == false",
+        "input": {
+          "level": "INFO",
+          "message": "IOC checked - below threshold. VT Score: $steps.virustotal_url_scan.vt_positives. Monitoring only.",
+          "data": {
+            "url": "$steps.extract_iocs.extracted_urls[0]",
+            "score": "$steps.virustotal_url_scan.vt_positives",
+            "hostname": "$steps.parse_wazuh_alert.hostname"
+          }
+        }
+      },
+      {
+        "step": 12,
+        "id": "update_wazuh_active_response",
+        "name": "Update Wazuh Active Response",
+        "app": "HTTP",
+        "action": "PUT",
+        "description": "Send active response back to Wazuh to trigger host-level blocks",
+        "input": {
+          "url": "$ENV.WAZUH_API_URL/active-response",
+          "headers": {
+            "Authorization": "Bearer $ENV.WAZUH_API_TOKEN"
+          },
+          "body": {
+            "command": "block-ip",
+            "arguments": ["$steps.parse_wazuh_alert.source_ip"],
+            "alert": {
+              "data": {
+                "srcip": "$steps.parse_wazuh_alert.source_ip"
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "metadata": {
+    "author": "SOC Automation Team",
+    "version": "1.0.0",
+    "created": "2024-01-01",
+    "tags": ["phishing", "email", "ioc-enrichment", "auto-contain"],
+    "mitre_attack": ["T1566", "T1566.001", "T1566.002"],
+    "estimated_runtime_seconds": 45
+  }
+}

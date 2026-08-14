@@ -114,7 +114,7 @@ shuffle-soar-project/
 ### 1. Clone & Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/shuffle-soar-playbooks.git
+git clone https://github.com/AkshitSharma07/shuffle-soar-playbooks.git
 cd shuffle-soar-playbooks
 chmod +x scripts/setup.sh
 ./scripts/setup.sh
